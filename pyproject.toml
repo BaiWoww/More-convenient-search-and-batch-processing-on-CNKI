@@ -1,0 +1,48 @@
+[project]
+name = "cnki-desktop"
+version = "0.1.0"
+description = "CNKI literature search assistant desktop application"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "CNKI Desktop contributors" }
+]
+keywords = ["cnki", "desktop", "pyside6", "playwright", "literature"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: Education",
+  "License :: OSI Approved :: MIT License",
+  "Natural Language :: Chinese (Simplified)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Desktop Environment",
+]
+dependencies = [
+  "PySide6>=6.5.0",
+  "playwright>=1.40.0",
+  "beautifulsoup4>=4.12.0",
+  "lxml>=4.9.0",
+  "openpyxl>=3.1.0",
+  "python-docx>=0.8.11",
+  "pyinstaller>=6.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-name/cnki-desktop"
+Issues = "https://github.com/your-name/cnki-desktop/issues"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
