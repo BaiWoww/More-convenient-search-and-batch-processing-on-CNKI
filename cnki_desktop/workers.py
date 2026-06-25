@@ -22,6 +22,7 @@ from core.api import (
     Paper, ajax_search, parse_search_results,
     parse_detail, fetch_via_browser, normalize_title, match_paper,
 )
+from core.citation_fetch import fetch_citation, fetch_citations_batch
 from core.download import (
     safe_filename, get_pdf_url_from_detail,
     browser_download, refresh_session,
@@ -37,6 +38,7 @@ class CommandType(enum.Enum):
     INIT_BROWSER = "init_browser"
     SEARCH = "search"
     FETCH_DETAILS = "fetch_details"
+    FETCH_CITATIONS = "fetch_citations"
     DOWNLOAD_PDFS = "download_pdfs"
     EXPORT = "export"
     STOP = "stop"
@@ -70,6 +72,7 @@ class BrowserWorker(QObject):
     progress = Signal(int, int)
     search_done = Signal(list)
     details_done = Signal(list)
+    citations_done = Signal(list)  # 引用获取完成，返回更新后的 Paper 列表
     download_done = Signal(str, bool, str)
     download_batch_done = Signal(dict)
     export_done = Signal(str)
@@ -220,8 +223,194 @@ class BrowserWorker(QObject):
             time.sleep(3)
         return False
 
+    def _wait_for_selector(self, selector: str, timeout: int = 10) -> bool:
+        """等待元素出现"""
+        try:
+            self._page.wait_for_selector(selector, timeout=timeout * 1000)
+            return True
+        except Exception:
+            return False
+
+    def _select_search_field(self, field_code: str) -> bool:
+        """通过页面交互选择搜索字段。
+
+        Args:
+            field_code: 搜索字段代码 (SU, TI, KY, etc.)
+
+        Returns:
+            是否选择成功
+        """
+        try:
+            # 点击搜索字段下拉框的默认项
+            sort_default = self._page.query_selector("#DBFieldBox .sort-default")
+            if not sort_default:
+                sort_default = self._page.query_selector("#DBFieldBox")
+            if not sort_default:
+                return False
+            sort_default.click()
+            time.sleep(0.5)
+
+            # 找到对应的 li 元素并点击（根据 cnki.md，li 的 value 就是字段代码）
+            field_item = self._page.query_selector("#DBFieldList li[value='{}']".format(field_code))
+            if field_item:
+                field_item.click()
+                time.sleep(0.5)
+                return True
+
+            # 备选：通过 a 标签的 value 属性匹配
+            a_elem = self._page.query_selector("#DBFieldList a[value^='{}']".format(field_code))
+            if a_elem:
+                a_elem.click()
+                time.sleep(0.5)
+                return True
+
+            # 文本匹配兜底
+            all_lis = self._page.query_selector_all("#DBFieldList li")
+            field_name_map = {
+                "SU": "主题", "TKA": "篇关摘", "KY": "关键词", "TI": "篇名",
+                "FT": "全文", "AU": "作者", "FI": "第一作者", "RP": "通讯作者",
+                "AF": "作者单位", "FU": "基金", "AB": "摘要", "CO": "小标题",
+                "RF": "参考文献", "CLC": "分类号", "LY": "文献来源", "DOI": "DOI",
+            }
+            target_name = field_name_map.get(field_code, "")
+            if target_name:
+                for li in all_lis:
+                    text = li.inner_text().strip()
+                    if text == target_name or target_name in text:
+                        li.click()
+                        time.sleep(0.5)
+                        return True
+
+            return False
+        except Exception:
+            return False
+
+    def _input_keyword(self, keyword: str) -> bool:
+        """输入搜索关键词"""
+        try:
+            # 多策略定位搜索输入框
+            selectors = [
+                "#txt_SearchText",
+                "textarea#txt_SearchText",
+                "textarea.search-input",
+                "[name='txt_SearchText']",
+                "input#txt_SearchText",
+                ".search-input",
+                "[placeholder*='检索词']",
+                "[placeholder*='文献']",
+                "input[type='text'][name*='Search']",
+            ]
+
+            input_elem = None
+            for sel in selectors:
+                try:
+                    if self._wait_for_selector(sel, timeout=3):
+                        input_elem = self._page.query_selector(sel)
+                        if input_elem and input_elem.is_visible():
+                            break
+                except Exception:
+                    continue
+
+            if not input_elem:
+                return False
+
+            # 点击激活
+            input_elem.click()
+            time.sleep(0.3)
+
+            # 清空内容
+            try:
+                input_elem.fill("")
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+            # 输入关键词
+            input_elem.type(keyword, delay=50)
+            time.sleep(0.3)
+
+            # 验证输入是否成功
+            try:
+                input_value = input_elem.input_value()
+                if not input_value or keyword not in input_value:
+                    # 再试一次
+                    input_elem.fill(keyword)
+                    time.sleep(0.2)
+            except Exception:
+                pass
+
+            return True
+        except Exception:
+            return False
+
+    def _click_search_button(self) -> bool:
+        """点击搜索按钮"""
+        try:
+            # 多策略定位搜索按钮
+            selectors = [
+                "div.search-btn",
+                ".search-btn",
+                "#Search",
+                "button.search-btn",
+                "[type='submit']",
+                ".btn-search",
+                "#btnSearch",
+            ]
+
+            for sel in selectors:
+                btn = self._page.query_selector(sel)
+                if btn and btn.is_visible():
+                    btn.click()
+                    return True
+
+            return False
+        except Exception:
+            return False
+
+    def _get_first_title(self) -> str:
+        """获取当前页面第一条结果的标题，用于判断翻页是否成功"""
+        try:
+            first_title = self._page.query_selector("tr td.name a.fz14")
+            if first_title:
+                return first_title.inner_text().strip()
+        except Exception:
+            pass
+        return ""
+
+    def _click_next_page(self) -> bool:
+        """点击下一页按钮，返回是否成功"""
+        try:
+            next_btn = self._page.query_selector("#PageNext")
+            if not next_btn:
+                return False
+            class_attr = next_btn.get_attribute("class") or ""
+            if "disabled" in class_attr or "hide" in class_attr:
+                return False
+            next_btn.click()
+            time.sleep(2)
+            return True
+        except Exception:
+            return False
+
+    def _wait_for_page_change(self, old_title: str, timeout: int = 10) -> bool:
+        """等待页面内容变化（翻页成功）
+
+        Args:
+            old_title: 翻页前的第一条标题
+            timeout: 超时时间秒
+
+        Returns:
+            是否成功翻页成功
+        """
+        for _ in range(timeout * 2):
+            time.sleep(0.5)
+            new_title = self._get_first_title()
+            if new_title and new_title != old_title:
+                return True
+        return False
+
     def _do_search(self, params: dict):
-        """执行搜索"""
+        """执行搜索 - 完全改用页面交互方式"""
         keyword = params.get("keyword", "")
         field = params.get("field", "SU")
         classid = params.get("classid", "YSTT4HG0")
@@ -233,39 +422,97 @@ class BrowserWorker(QObject):
 
         self.log.emit(f"开始搜索: {keyword} (字段: {field}, 数据库: {classid})")
 
+        # 导航到搜索页
+        self.log.emit("正在导航到 CNKI 搜索页...")
+        try:
+            self._page.goto(CNKI_SEARCH_URL, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(2)
+        except Exception as e:
+            self.log.emit(f"导航搜索页失败，尝试首页: {e}")
+            try:
+                self._page.goto(CNKI_HOME_URL, wait_until="domcontentloaded", timeout=20000)
+                time.sleep(2)
+            except Exception as e2:
+                self.error.emit(f"导航失败: {e2}")
+                self.search_done.emit([])
+                return
+
+        # 打印当前页面 URL 帮助排查
+        self.log.emit(f"当前页面: {self._page.url}")
+
+        # 选择搜索字段
+        self.log.emit(f"选择搜索字段: {field}")
+        if not self._select_search_field(field):
+            self.log.emit("搜索字段选择失败，将使用默认字段")
+
+        # 输入关键词
+        self.log.emit(f"输入关键词: {keyword}")
+        if not self._input_keyword(keyword):
+            self.error.emit("关键词输入失败，请检查浏览器页面")
+            self.search_done.emit([])
+            return
+
+        # 点击搜索按钮
+        self.log.emit("点击搜索按钮...")
+        if not self._click_search_button():
+            # 备选：按回车搜索
+            self.log.emit("点击搜索按钮失败，尝试按回车...")
+            try:
+                self._page.keyboard.press("Enter")
+            except Exception:
+                self.error.emit("搜索触发失败")
+                self.search_done.emit([])
+                return
+
+        # 等待结果加载
+        self.log.emit("等待搜索结果加载...")
+        time.sleep(4)
+
+        # 检查验证码
+        if self._check_captcha():
+            self.log.emit("检测到验证码，请在浏览器窗口中完成验证...")
+            self.captcha_required.emit()
+            if not self._wait_captcha_resolution():
+                self.error.emit("验证码处理超时或已取消")
+                self.search_done.emit([])
+                return
+            time.sleep(2)
+
+        # 等待搜索结果表格出现
+        result_found = False
+        for _ in range(10):
+            if self._page.query_selector("td.name a.fz14"):
+                result_found = True
+                break
+            time.sleep(1)
+
+        if not result_found:
+            self.log.emit("未找到搜索结果，可能关键词无匹配或页面加载异常")
+            self.search_done.emit([])
+            return
+
         all_papers = []
         seen_titles = set()
 
+        # 逐页获取
         for page_num in range(1, max_pages + 1):
             if self._stop_event:
                 self.log.emit("搜索已取消")
                 break
 
             self.progress.emit(page_num, max_pages)
-            self.log.emit(f"正在搜索第 {page_num}/{max_pages} 页...")
+            self.log.emit(f"正在获取第 {page_num}/{max_pages} 页...")
 
-            papers_data, err = ajax_search(
-                self._page, keyword, field=field,
-                classid=classid, page_num=page_num, page_size=20
-            )
-
-            if err == "captcha":
-                self.log.emit("检测到验证码，请在浏览器窗口中完成验证...")
-                self.captcha_required.emit()
-                if not self._wait_captcha_resolution():
-                    self.error.emit("验证码处理超时或已取消")
-                    break
-                # 验证通过后重试当前页
-                papers_data, err = ajax_search(
-                    self._page, keyword, field=field,
-                    classid=classid, page_num=page_num, page_size=20
-                )
-                if err:
-                    self.error.emit(f"搜索出错: {err}")
-                    break
+            # 获取当前页 HTML 内容
+            try:
+                html = self._page.content()
+                papers_data = parse_search_results(html)
+            except Exception as e:
+                self.log.emit(f"页面解析失败: {e}")
+                break
 
             if not papers_data:
-                self.log.emit(f"第 {page_num} 页没有更多结果")
+                self.log.emit(f"第 {page_num} 页没有结果")
                 break
 
             new_count = 0
@@ -282,7 +529,21 @@ class BrowserWorker(QObject):
 
             self.log.emit(f"第 {page_num} 页: 获取 {len(papers_data)} 条，新增 {new_count} 条")
 
-            if not papers_data:
+            # 如果是最后一页，就不再翻页
+            if page_num >= max_pages:
+                break
+
+            # 记录当前页第一条标题，用于验证翻页
+            old_title = self._get_first_title()
+
+            # 点击下一页
+            if not self._click_next_page():
+                self.log.emit("没有下一页或已到达末尾")
+                break
+
+            # 等待页面变化
+            if not self._wait_for_page_change(old_title):
+                self.log.emit("翻页后页面未变化，可能已到末尾")
                 break
 
             time.sleep(QUERY_DELAY)
@@ -346,6 +607,51 @@ class BrowserWorker(QObject):
 
         self.details_done.emit(updated)
         self.log.emit(f"详情获取完成: {len(updated)}/{total} 篇")
+
+    def _do_fetch_citations(self, params: dict):
+        """批量获取引用"""
+        papers = params.get("papers", [])
+        total = len(papers)
+
+        if not self._browser_ready:
+            self.error.emit("浏览器未就绪，请先启动浏览器")
+            return
+
+        self.log.emit(f"开始获取 {total} 篇论文的引用信息...")
+
+        # 确保当前页面在搜索结果页
+        try:
+            self._page.goto(CNKI_SEARCH_URL, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(2)
+        except Exception:
+            pass
+
+        updated = []
+        for i, paper in enumerate(papers):
+            if self._stop_event:
+                self.log.emit("获取引用已取消")
+                break
+
+            self.progress.emit(i + 1, total)
+            self.log.emit(f"[{i+1}/{total}] 获取引用: {paper.title[:50]}...")
+
+            # 尝试获取引用（需要论文在搜索结果列表中）
+            try:
+                citation = fetch_citation(self._page, i + 1)
+                if citation:
+                    paper.citation_text = citation
+                    paper.citation_fetched = True
+                    self.log.emit(f"  -> 引用获取成功")
+                else:
+                    self.log.emit(f"  -> 引用获取失败或未找到")
+            except Exception as e:
+                self.log.emit(f"  -> 获取失败: {e}")
+
+            updated.append(paper)
+            time.sleep(0.5)
+
+        self.citations_done.emit(updated)
+        self.log.emit(f"引用获取完成: {sum(1 for p in updated if p.citation_fetched)}/{total} 篇")
 
     def _do_download_pdfs(self, params: dict):
         """批量下载 PDF"""
@@ -550,6 +856,8 @@ class BrowserWorker(QObject):
                     self._do_search(cmd.payload)
                 elif cmd.command == CommandType.FETCH_DETAILS:
                     self._do_fetch_details(cmd.payload)
+                elif cmd.command == CommandType.FETCH_CITATIONS:
+                    self._do_fetch_citations(cmd.payload)
                 elif cmd.command == CommandType.DOWNLOAD_PDFS:
                     self._do_download_pdfs(cmd.payload)
                 elif cmd.command == CommandType.EXPORT:

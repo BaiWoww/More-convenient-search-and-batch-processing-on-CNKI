@@ -50,6 +50,9 @@ class Paper:
     search_field: str = ""
     search_classid: str = ""
     doc_type: str = ""  # J/D/C/N/P/S
+    # 引用信息
+    citation_text: str = ""  # GB/T 7714-2025 格式引文
+    citation_fetched: bool = False
     # GUI状态
     selected: bool = False
     detail_fetched: bool = False
@@ -95,6 +98,45 @@ class Paper:
         return p
 
 
+FIELD_KEY_MAP = {
+    "SU": "Subject",
+    "TKA": "TitleKeywordAbstract",
+    "KY": "Keyword",
+    "TI": "Title",
+    "FT": "FullText",
+    "AU": "Author",
+    "FI": "FirstAuthor",
+    "RP": "CorrespondingAuthor",
+    "AF": "Organization",
+    "FU": "Fund",
+    "AB": "Abstract",
+    "CO": "SubTitle",
+    "RF": "Reference",
+    "CLC": "CLC",
+    "LY": "Journal",
+    "DOI": "DOI",
+}
+
+FIELD_OPERATOR_MAP = {
+    "SU": "TOPRANK",
+    "TKA": "%",
+    "KY": "=",
+    "TI": "%",
+    "FT": "%",
+    "AU": "=",
+    "FI": "=",
+    "RP": "%",
+    "AF": "%",
+    "FU": "%",
+    "AB": "%",
+    "CO": "%",
+    "RF": "%",
+    "CLC": "=",
+    "LY": "%",
+    "DOI": "=",
+}
+
+
 def ajax_search(page, keyword, field="SU", classid=None, page_num=1, page_size=20):
     """执行CNKI AJAX搜索，返回论文字典列表。
 
@@ -110,14 +152,16 @@ def ajax_search(page, keyword, field="SU", classid=None, page_num=1, page_size=2
         论文字典列表
     """
     classid = classid or "YSTT4HG0"
+    qnode_key = FIELD_KEY_MAP.get(field, "Subject")
+    operator = FIELD_OPERATOR_MAP.get(field, "TOPRANK")
 
     query_json = json.dumps({
         "Platform": "", "Resource": "",
         "Classid": classid,
         "Products": "",
-        "QNode": {"QGroup": [{"Key": "Subject", "Title": "", "Logic": 0,
+        "QNode": {"QGroup": [{"Key": qnode_key, "Title": "", "Logic": 0,
             "Items": [{"Field": field, "Value": keyword,
-                        "Operator": "TOPRANK" if field == "SU" else "=",
+                        "Operator": operator,
                         "Logic": 0}],
             "ChildItems": []}]},
         "ExScope": 1, "SearchType": 7, "Rlang": "CHINESE", "KuaKuCode": "",
@@ -140,6 +184,7 @@ def ajax_search(page, keyword, field="SU", classid=None, page_num=1, page_size=2
                 headers: {
                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "X-Requested-With": "XMLHttpRequest",
+                    "Referer": "https://kns.cnki.net/kns8s/defaultresult/index",
                 },
                 body: body, credentials: "include",
             });
@@ -167,6 +212,8 @@ def ajax_search(page, keyword, field="SU", classid=None, page_num=1, page_size=2
 
 def parse_search_results(html):
     """解析CNKI搜索结果HTML为论文字典列表。
+    
+    根据 cnki.md 提供的 HTML 结构优化选择器。
 
     Returns: list of {title, authors, journal, date, cited, downloads, url, dbname, filename, bar_url}
     """
@@ -174,21 +221,40 @@ def parse_search_results(html):
     papers = []
 
     for row in soup.find_all("tr"):
-        tl = row.select_one("td.name a.fz14") or row.select_one("a.fz14")
-        if not tl:
+        # 检查是否有 cbItem checkbox（确认是有效结果行）
+        checkbox = row.select_one("input.cbItem")
+        if not checkbox:
             continue
-        title = tl.get_text(strip=True)
-        href = tl.get("href", "")
-        authors = [a.get_text(strip=True) for a in row.select("td.author a")
-                    if a.get_text(strip=True)]
-        src = row.select_one("td.source a") or row.select_one("td.source")
-        journal = src.get_text(strip=True) if src else ""
-        dt = row.select_one("td.date")
-        date = dt.get_text(strip=True) if dt else ""
-        ct = row.select_one("td.quote a") or row.select_one("td.quote")
-        cited = ct.get_text(strip=True) if ct else ""
-        dl = row.select_one("td.download a") or row.select_one("td.download")
-        downloads = dl.get_text(strip=True) if dl else ""
+
+        # 标题：td.name a.fz14
+        title_elem = row.select_one("td.name a.fz14") or row.select_one("a.fz14")
+        if not title_elem:
+            continue
+        title = title_elem.get_text(strip=True)
+        href = title_elem.get("href", "")
+
+        # 作者：td.author a.KnowledgeNetLink 或 td.author a
+        authors = [a.get_text(strip=True) for a in row.select("td.author a.KnowledgeNetLink")
+                   if a.get_text(strip=True)]
+        if not authors:
+            authors = [a.get_text(strip=True) for a in row.select("td.author a")
+                       if a.get_text(strip=True)]
+
+        # 来源：td.source
+        source_elem = row.select_one("td.source a") or row.select_one("td.source")
+        journal = source_elem.get_text(strip=True) if source_elem else ""
+
+        # 日期：td.date
+        date_elem = row.select_one("td.date")
+        date = date_elem.get_text(strip=True) if date_elem else ""
+
+        # 引用数：td.quote
+        quote_elem = row.select_one("td.quote a") or row.select_one("td.quote")
+        cited = quote_elem.get_text(strip=True) if quote_elem else ""
+
+        # 下载数：td.download
+        download_elem = row.select_one("td.download a") or row.select_one("td.download")
+        downloads = download_elem.get_text(strip=True) if download_elem else ""
 
         # bar.cnki.net download URL
         dl_link = row.select_one("a.downloadlink")
